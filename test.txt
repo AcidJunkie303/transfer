@@ -1,0 +1,173 @@
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace SessionInterop
+{
+    public enum WTS_CONNECTSTATE_CLASS
+    {
+        WTSActive,
+        WTSConnected,
+        WTSConnectQuery,
+        WTSShadow,
+        WTSDisconnected,
+        WTSIdle,
+        WTSListen,
+        WTSReset,
+        WTSDown,
+        WTSInit
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    public struct WTS_SESSION_INFO_1
+    {
+        public uint ExecEnvId;
+        public WTS_CONNECTSTATE_CLASS State;
+        public uint SessionId;
+        public string pSessionName;
+        public string pHostName;
+        public string pUserName;
+        public string pDomainName;
+        public string pFarmName;
+    }
+
+    public static class WtsApi
+    {
+        [DllImport("wtsapi32.dll", CharSet = CharSet.Auto)]
+        public static extern IntPtr WTSOpenServerEx(string pServerName);
+
+        [DllImport("wtsapi32.dll", CharSet = CharSet.Auto)]
+        public static extern bool WTSEnumerateSessionsEx(
+            IntPtr hServer,
+            ref uint pLevel,
+            uint Filter,
+            out IntPtr ppSessionInfo,
+            out uint pCount);
+
+        [DllImport("wtsapi32.dll", CharSet = CharSet.Auto)]
+        public static extern void WTSFreeMemoryEx(IntPtr pMemory);
+
+        [DllImport("wtsapi32.dll", CharSet = CharSet.Auto)]
+        public static extern void WTSFreeMemory(IntPtr pMemory);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern bool CreateProcessAsUser(
+            IntPtr hToken,
+            string lpApplicationName,
+            string lpCommandLine,
+            IntPtr lpProcessAttributes,
+            IntPtr lpThreadAttributes,
+            bool bInheritHandles,
+            uint dwCreationFlags,
+            IntPtr lpEnvironment,
+            string lpCurrentDirectory,
+            ref STARTUPINFO lpStartupInfo,
+            out PROCESS_INFORMATION lpProcessInformation);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct STARTUPINFO
+        {
+            public int cb;
+            public string lpReserved;
+            public string lpDesktop;
+            public string lpTitle;
+            public int dwX;
+            public int dwY;
+            public int dwXSize;
+            public int dwYSize;
+            public int dwXCountChars;
+            public int dwYCountChars;
+            public int dwFillAttribute;
+            public int dwFlags;
+            public short wShowWindow;
+            public short cbReserved2;
+            public IntPtr lpReserved2;
+            public IntPtr hStdInput;
+            public IntPtr hStdOutput;
+            public IntPtr hStdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct PROCESS_INFORMATION
+        {
+            public IntPtr hProcess;
+            public IntPtr hThread;
+            public int dwProcessId;
+            public int dwThreadId;
+        }
+    }
+}
+'@
+
+# Enumerate sessions and find first logged-on user
+$serverHandle = [SessionInterop.WtsApi]::WTSOpenServerEx([System.Environment]::MachineName)
+$level = 1
+$ppSessionInfo = [IntPtr]::Zero
+$sessionCount = 0
+
+if ([SessionInterop.WtsApi]::WTSEnumerateSessionsEx(
+    $serverHandle,
+    [ref]$level,
+    0,
+    [ref]$ppSessionInfo,
+    [ref]$sessionCount))
+{
+    try {
+        $firstUserSession = $null
+        $currentSessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+
+        for ($i = 0; $i -lt $sessionCount; $i++) {
+            $sessionInfo = [System.Runtime.InteropServices.Marshal]::PtrToStructure(
+                [IntPtr]($ppSessionInfo.ToInt64() + $i * [System.Runtime.InteropServices.Marshal]::SizeOf([SessionInterop.WTS_SESSION_INFO_1])),
+                [SessionInterop.WTS_SESSION_INFO_1])
+
+            if (![string]::IsNullOrEmpty($sessionInfo.pUserName) -and 
+                $sessionInfo.State -eq [SessionInterop.WTS_CONNECTSTATE_CLASS]::WTSActive -and
+                $sessionInfo.SessionId -ne $currentSessionId)
+            {
+                $firstUserSession = $sessionInfo
+                break
+            }
+        }
+
+        if ($firstUserSession -ne $null) {
+            Write-Host "Found user session: $($firstUserSession.pUserName) (Session ID: $($firstUserSession.SessionId))"
+
+            # Prepare process startup info
+            $startupInfo = New-Object SessionInterop.WtsApi+STARTUPINFO
+            $startupInfo.cb = [System.Runtime.InteropServices.Marshal]::SizeOf($startupInfo)
+            $startupInfo.lpDesktop = "winsta0\default"
+            $processInfo = New-Object SessionInterop.WtsApi+PROCESS_INFORMATION
+
+            # Create process in user session (replace notepad.exe with your target process)
+            $success = [SessionInterop.WtsApi]::CreateProcessAsUser(
+                [IntPtr]::Zero,
+                "C:\\Windows\\System32\\notepad.exe",
+                $null,
+                [IntPtr]::Zero,
+                [IntPtr]::Zero,
+                $false,
+                0x08000000,  # CREATE_NO_WINDOW
+                [IntPtr]::Zero,
+                $null,
+                [ref]$startupInfo,
+                [ref]$processInfo)
+
+            if ($success) {
+                Write-Host "Process started successfully in user session"
+            }
+            else {
+                Write-Error "Failed to create process (Error: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
+            }
+        }
+        else {
+            Write-Warning "No active user sessions found"
+        }
+    }
+    finally {
+        [SessionInterop.WtsApi]::WTSFreeMemoryEx($ppSessionInfo)
+    }
+}
+else {
+    Write-Error "Failed to enumerate sessions (Error: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
+}
