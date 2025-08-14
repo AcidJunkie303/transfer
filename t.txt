@@ -1,8 +1,20 @@
+
+
+
+
+
 using System;
 using System.IO;
 using IWshRuntimeLibrary;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
+
+[ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IShellLinkW
+{
+    // Method declarations
+}
+
 
 // Define these as needed for COM interop
 [ComImport]
