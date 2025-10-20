@@ -1,74 +1,357 @@
 using System;
-using System.Collections.Generic;
 using System.Linq;
-using System.Linq.Expressions;
-using System.Reflection;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Threading.Tasks;
+using Microsoft.Identity.Client;
 
-namespace Helper
+namespace GitLabEntraIdAuth
 {
-    public static class LeftJoinExtension
+    public class GitLabApiClient
     {
-        public static IQueryable<TResult> LeftJoin<TOuter, TInner, TKey, TResult>(
-            this IQueryable<TOuter> outer,
-            IQueryable<TInner> inner,
-            Expression<Func<TOuter, TKey>> outerKeySelector,
-            Expression<Func<TInner, TKey>> innerKeySelector,
-            Expression<Func<TOuter, TInner, TResult>> resultSelector)
+        // Azure Entra ID Configuration
+        private const string ClientId = "YOUR_AZURE_APP_CLIENT_ID";
+        private const string TenantId = "YOUR_TENANT_ID"; // or use "organizations" for multi-tenant
+        private const string Authority = $"https://login.microsoftonline.com/{TenantId}";
+        
+        // GitLab Configuration
+        private const string GitLabBaseUrl = "https://gitlab.example.com";
+        private const string GitLabApiUrl = $"{GitLabBaseUrl}/api/v4";
+        
+        // Scopes required for authentication
+        private static readonly string[] Scopes = new[]
         {
-            MethodInfo groupJoin = typeof(Queryable).GetMethods()
-                                                     .Single(m => m.ToString() == "System.Linq.IQueryable`1[TResult] GroupJoin[TOuter,TInner,TKey,TResult](System.Linq.IQueryable`1[TOuter], System.Collections.Generic.IEnumerable`1[TInner], System.Linq.Expressions.Expression`1[System.Func`2[TOuter,TKey]], System.Linq.Expressions.Expression`1[System.Func`2[TInner,TKey]], System.Linq.Expressions.Expression`1[System.Func`3[TOuter,System.Collections.Generic.IEnumerable`1[TInner],TResult]])")
-                                                     .MakeGenericMethod(typeof(TOuter), typeof(TInner), typeof(TKey), typeof(LeftJoinIntermediate<TOuter, TInner>));
-            MethodInfo selectMany = typeof(Queryable).GetMethods()
-                                                      .Single(m => m.ToString() == "System.Linq.IQueryable`1[TResult] SelectMany[TSource,TCollection,TResult](System.Linq.IQueryable`1[TSource], System.Linq.Expressions.Expression`1[System.Func`2[TSource,System.Collections.Generic.IEnumerable`1[TCollection]]], System.Linq.Expressions.Expression`1[System.Func`3[TSource,TCollection,TResult]])")
-                                                      .MakeGenericMethod(typeof(LeftJoinIntermediate<TOuter, TInner>), typeof(TInner), typeof(TResult));
+            // For GitLab integrated with Azure AD, you may need:
+            "openid",
+            "profile", 
+            "email",
+            // Or use your GitLab OAuth app scope if registered in Azure AD
+            $"api://{ClientId}/api.read"
+        };
 
-            var groupJoinResultSelector = (Expression<Func<TOuter, IEnumerable<TInner>, LeftJoinIntermediate<TOuter, TInner>>>)
-                                          ((oneOuter, manyInners) => new LeftJoinIntermediate<TOuter, TInner> { OneOuter = oneOuter, ManyInners = manyInners });
+        private readonly IPublicClientApplication _publicClientApp;
+        private readonly HttpClient _httpClient;
+        private AuthenticationResult _authResult;
 
-            MethodCallExpression exprGroupJoin = Expression.Call(groupJoin, outer.Expression, inner.Expression, outerKeySelector, innerKeySelector, groupJoinResultSelector);
+        public GitLabApiClient()
+        {
+            // Initialize MSAL Public Client Application
+            _publicClientApp = PublicClientApplicationBuilder
+                .Create(ClientId)
+                .WithAuthority(Authority)
+                .WithDefaultRedirectUri()
+                .Build();
 
-            var selectManyCollectionSelector = (Expression<Func<LeftJoinIntermediate<TOuter, TInner>, IEnumerable<TInner>>>)
-                                               (t => t.ManyInners.DefaultIfEmpty());
-
-            ParameterExpression paramUser = resultSelector.Parameters.First();
-
-            ParameterExpression paramNew = Expression.Parameter(typeof(LeftJoinIntermediate<TOuter, TInner>), "t");
-            MemberExpression propExpr = Expression.Property(paramNew, "OneOuter");
-
-            LambdaExpression selectManyResultSelector = Expression.Lambda(new Replacer(paramUser, propExpr).Visit(resultSelector.Body), paramNew, resultSelector.Parameters.Skip(1).First());
-
-            MethodCallExpression exprSelectMany = Expression.Call(selectMany, exprGroupJoin, selectManyCollectionSelector, selectManyResultSelector);
-
-            return outer.Provider.CreateQuery<TResult>(exprSelectMany);
+            _httpClient = new HttpClient
+            {
+                BaseAddress = new Uri(GitLabApiUrl)
+            };
         }
 
-        private class LeftJoinIntermediate<TOuter, TInner>
+        /// <summary>
+        /// Authenticates using Device Code Flow (supports 2FA)
+        /// </summary>
+        public async Task<bool> AuthenticateAsync()
         {
-            public TOuter OneOuter { get; set; }
-            public IEnumerable<TInner> ManyInners { get; set; }
-        }
-
-        private class Replacer : ExpressionVisitor
-        {
-            private readonly ParameterExpression _oldParam;
-            private readonly Expression _replacement;
-
-            public Replacer(ParameterExpression oldParam, Expression replacement)
+            try
             {
-                _oldParam = oldParam;
-                _replacement = replacement;
-            }
+                // First, try to get token silently from cache
+                var accounts = await _publicClientApp.GetAccountsAsync();
+                var firstAccount = accounts.FirstOrDefault();
 
-            public override Expression Visit(Expression exp)
-            {
-                if (exp == _oldParam)
+                if (firstAccount != null)
                 {
-                    return _replacement;
+                    try
+                    {
+                        _authResult = await _publicClientApp
+                            .AcquireTokenSilent(Scopes, firstAccount)
+                            .ExecuteAsync();
+                        
+                        Console.WriteLine($"Token acquired silently for user: {_authResult.Account.Username}");
+                        ConfigureHttpClient();
+                        return true;
+                    }
+                    catch (MsalUiRequiredException)
+                    {
+                        // Token cache lookup failed or user interaction required
+                        // Fall through to device code flow
+                    }
                 }
 
-                return base.Visit(exp);
+                // Acquire token using Device Code Flow
+                _authResult = await _publicClientApp
+                    .AcquireTokenWithDeviceCode(Scopes, deviceCodeResult =>
+                    {
+                        // Display the device code message to the user
+                        Console.WriteLine(deviceCodeResult.Message);
+                        Console.WriteLine();
+                        Console.WriteLine($"User Code: {deviceCodeResult.UserCode}");
+                        Console.WriteLine($"Verification URL: {deviceCodeResult.VerificationUrl}");
+                        Console.WriteLine();
+                        Console.WriteLine("Please authenticate on another device and enter the code above.");
+                        Console.WriteLine("Waiting for authentication...");
+                        
+                        return Task.CompletedTask;
+                    })
+                    .ExecuteAsync();
+
+                Console.WriteLine($"\nAuthentication successful!");
+                Console.WriteLine($"User: {_authResult.Account.Username}");
+                Console.WriteLine($"Token expires: {_authResult.ExpiresOn.LocalDateTime}");
+                
+                ConfigureHttpClient();
+                return true;
             }
+            catch (MsalServiceException ex)
+            {
+                Console.WriteLine($"MSAL Service Exception: {ex.Message}");
+                Console.WriteLine($"Error Code: {ex.ErrorCode}");
+                
+                if (ex.ErrorCode == "invalid_tenant")
+                {
+                    Console.WriteLine("The tenant ID is invalid. Please check your configuration.");
+                }
+                else if (ex.ErrorCode == "unauthorized_client")
+                {
+                    Console.WriteLine("The application is not configured correctly. " +
+                                    "Ensure 'Allow public client flows' is set to Yes in Azure portal.");
+                }
+                
+                return false;
+            }
+            catch (MsalClientException ex)
+            {
+                Console.WriteLine($"MSAL Client Exception: {ex.Message}");
+                Console.WriteLine($"Error Code: {ex.ErrorCode}");
+                
+                if (ex.ErrorCode == "device_code_expired")
+                {
+                    Console.WriteLine("The device code has expired. Please try again.");
+                }
+                
+                return false;
+            }
+            catch (OperationCanceledException)
+            {
+                Console.WriteLine("Authentication was cancelled.");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Unexpected error: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Configures HttpClient with Bearer token
+        /// </summary>
+        private void ConfigureHttpClient()
+        {
+            _httpClient.DefaultRequestHeaders.Authorization = 
+                new AuthenticationHeaderValue("Bearer", _authResult.AccessToken);
+            
+            _httpClient.DefaultRequestHeaders.Accept.Clear();
+            _httpClient.DefaultRequestHeaders.Accept.Add(
+                new MediaTypeWithQualityHeaderValue("application/json"));
+        }
+
+        /// <summary>
+        /// Ensures the token is valid and refreshes if necessary
+        /// </summary>
+        private async Task EnsureAuthenticatedAsync()
+        {
+            if (_authResult == null)
+            {
+                throw new InvalidOperationException(
+                    "Not authenticated. Call AuthenticateAsync() first.");
+            }
+
+            // Check if token is about to expire (within 5 minutes)
+            if (_authResult.ExpiresOn.AddMinutes(-5) <= DateTimeOffset.UtcNow)
+            {
+                Console.WriteLine("Token is expiring, refreshing...");
+                
+                var account = await _publicClientApp.GetAccountAsync(_authResult.Account.HomeAccountId.Identifier);
+                
+                try
+                {
+                    _authResult = await _publicClientApp
+                        .AcquireTokenSilent(Scopes, account)
+                        .ExecuteAsync();
+                    
+                    ConfigureHttpClient();
+                    Console.WriteLine("Token refreshed successfully.");
+                }
+                catch (MsalUiRequiredException)
+                {
+                    Console.WriteLine("Token refresh requires user interaction.");
+                    await AuthenticateAsync();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gets the current user information from GitLab
+        /// </summary>
+        public async Task<string> GetCurrentUserAsync()
+        {
+            await EnsureAuthenticatedAsync();
+
+            try
+            {
+                var response = await _httpClient.GetAsync("/user");
+                
+                if (response.IsSuccessStatusCode)
+                {
+                    var content = await response.Content.ReadAsStringAsync();
+                    return content;
+                }
+                else
+                {
+                    var errorContent = await response.Content.ReadAsStringAsync();
+                    throw new HttpRequestException(
+                        $"GitLab API request failed with status {response.StatusCode}: {errorContent}");
+                }
+            }
+            catch (HttpRequestException ex)
+            {
+                Console.WriteLine($"HTTP Request failed: {ex.Message}");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Gets all projects accessible to the authenticated user
+        /// </summary>
+        public async Task<string> GetProjectsAsync()
+        {
+            await EnsureAuthenticatedAsync();
+
+            try
+            {
+                var response = await _httpClient.GetAsync("/projects?membership=true");
+                
+                if (response.IsSuccessStatusCode)
+                {
+                    var content = await response.Content.ReadAsStringAsync();
+                    return content;
+                }
+                else
+                {
+                    var errorContent = await response.Content.ReadAsStringAsync();
+                    throw new HttpRequestException(
+                        $"GitLab API request failed with status {response.StatusCode}: {errorContent}");
+                }
+            }
+            catch (HttpRequestException ex)
+            {
+                Console.WriteLine($"HTTP Request failed: {ex.Message}");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Generic method to call any GitLab API endpoint
+        /// </summary>
+        public async Task<string> CallGitLabApiAsync(string endpoint, HttpMethod method = null, 
+            HttpContent content = null)
+        {
+            await EnsureAuthenticatedAsync();
+
+            method ??= HttpMethod.Get;
+
+            try
+            {
+                var request = new HttpRequestMessage(method, endpoint)
+                {
+                    Content = content
+                };
+
+                var response = await _httpClient.SendAsync(request);
+                
+                if (response.IsSuccessStatusCode)
+                {
+                    return await response.Content.ReadAsStringAsync();
+                }
+                else
+                {
+                    var errorContent = await response.Content.ReadAsStringAsync();
+                    throw new HttpRequestException(
+                        $"GitLab API request to {endpoint} failed with status {response.StatusCode}: {errorContent}");
+                }
+            }
+            catch (HttpRequestException ex)
+            {
+                Console.WriteLine($"HTTP Request to {endpoint} failed: {ex.Message}");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Signs out and clears the token cache
+        /// </summary>
+        public async Task SignOutAsync()
+        {
+            var accounts = await _publicClientApp.GetAccountsAsync();
+            
+            foreach (var account in accounts)
+            {
+                await _publicClientApp.RemoveAsync(account);
+            }
+            
+            _authResult = null;
+            _httpClient.DefaultRequestHeaders.Authorization = null;
+            
+            Console.WriteLine("Signed out successfully.");
+        }
+    }
+
+    // Example usage
+    class Program
+    {
+        static async Task Main(string[] args)
+        {
+            Console.WriteLine("GitLab API Client with Azure Entra ID Authentication");
+            Console.WriteLine("====================================================\n");
+
+            var client = new GitLabApiClient();
+
+            // Authenticate using Device Code Flow (supports 2FA)
+            var authenticated = await client.AuthenticateAsync();
+            
+            if (!authenticated)
+            {
+                Console.WriteLine("Authentication failed. Exiting...");
+                return;
+            }
+
+            try
+            {
+                // Get current user information
+                Console.WriteLine("\nFetching current user information...");
+                var userInfo = await client.GetCurrentUserAsync();
+                Console.WriteLine($"User Info: {userInfo}\n");
+
+                // Get user's projects
+                Console.WriteLine("Fetching projects...");
+                var projects = await client.GetProjectsAsync();
+                Console.WriteLine($"Projects: {projects}\n");
+
+                // Example: Call a custom GitLab API endpoint
+                Console.WriteLine("Fetching groups...");
+                var groups = await client.CallGitLabApiAsync("/groups?owned=true");
+                Console.WriteLine($"Groups: {groups}\n");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error calling GitLab API: {ex.Message}");
+            }
+
+            Console.WriteLine("\nPress any key to sign out and exit...");
+            Console.ReadKey();
+
+            await client.SignOutAsync();
         }
     }
 }
