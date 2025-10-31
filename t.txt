@@ -1,55 +1,43 @@
-public static class IQueryableExtensions
+public class Debouncer
 {
-    public static IOrderedQueryable<T> OrderBy<T>(this IQueryable<T> source, string propertyName)
+    private readonly int _delayMilliseconds;
+    private CancellationTokenSource _cts;
+    private DateTime _lastInvoke = DateTime.MinValue;
+    private bool _pending = false;
+
+    public Debouncer(int delayMilliseconds)
     {
-        return ApplyOrder(source, propertyName, "OrderBy");
+        _delayMilliseconds = delayMilliseconds;
     }
 
-    public static IOrderedQueryable<T> OrderByDescending<T>(this IQueryable<T> source, string propertyName)
+    public void Debounce(Action action)
     {
-        return ApplyOrder(source, propertyName, "OrderByDescending");
-    }
-
-    public static IOrderedQueryable<T> ThenBy<T>(this IOrderedQueryable<T> source, string propertyName)
-    {
-        return ApplyOrder(source, propertyName, "ThenBy");
-    }
-
-    public static IOrderedQueryable<T> ThenByDescending<T>(this IOrderedQueryable<T> source, string propertyName)
-    {
-        return ApplyOrder(source, propertyName, "ThenByDescending");
-    }
-
-    private static IOrderedQueryable<T> ApplyOrder<T>(IQueryable<T> source, string propertyName, string methodName)
-    {
-        // Get the property info
-        var type = typeof(T);
-        var property = type.GetProperty(propertyName, 
-            BindingFlags.IgnoreCase | BindingFlags.Public | BindingFlags.Instance);
-        
-        if (property == null)
+        var now = DateTime.Now;
+        if ((now - _lastInvoke).TotalMilliseconds > _delayMilliseconds)
         {
-            throw new ArgumentException($"Property '{propertyName}' not found on type {type.Name}");
+            // Not currently debouncing, run immediately
+            _pending = false;
+            _lastInvoke = now;
+            action();
         }
+        else
+        {
+            // Rapid call: debounce
+            _pending = true;
+            _cts?.Cancel();
+            _cts = new CancellationTokenSource();
+            var token = _cts.Token;
 
-        // Create parameter expression: x
-        var parameter = Expression.Parameter(type, "x");
-        
-        // Create property access expression: x.PropertyName
-        var propertyAccess = Expression.Property(parameter, property);
-        
-        // Create lambda expression: x => x.PropertyName
-        var lambda = Expression.Lambda(propertyAccess, parameter);
-
-        // Create the method call expression
-        var methodCallExpression = Expression.Call(
-            typeof(Queryable),
-            methodName,
-            new Type[] { type, property.PropertyType },
-            source.Expression,
-            Expression.Quote(lambda));
-
-        // Return new query
-        return (IOrderedQueryable<T>)source.Provider.CreateQuery<T>(methodCallExpression);
+            Task.Delay(_delayMilliseconds, token)
+                .ContinueWith(t =>
+                {
+                    if (!t.IsCanceled && _pending)
+                    {
+                        _pending = false;
+                        _lastInvoke = DateTime.Now;
+                        action();
+                    }
+                }, TaskScheduler.Current);
+        }
     }
 }
