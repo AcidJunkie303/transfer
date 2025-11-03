@@ -1,43 +1,110 @@
-public class Debouncer
-{
-    private readonly int _delayMilliseconds;
-    private CancellationTokenSource _cts;
-    private DateTime _lastInvoke = DateTime.MinValue;
-    private bool _pending = false;
+using System;
+using System.Threading;
+using System.Threading.Tasks;
 
-    public Debouncer(int delayMilliseconds)
+/// <summary>
+/// Throttler that allows immediate execution of the first request
+/// and subsequent requests only if more than the specified interval has passed.
+/// </summary>
+public class GridThrottler : IDisposable
+{
+    private readonly TimeSpan _interval;
+    private DateTime _lastExecutionTime = DateTime.MinValue;
+    private CancellationTokenSource _currentCancellationTokenSource;
+    private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
+    private Task _pendingTask;
+    private readonly object _lock = new object();
+
+    public GridThrottler(TimeSpan interval)
     {
-        _delayMilliseconds = delayMilliseconds;
+        _interval = interval;
     }
 
-    public void Debounce(Action action)
+    /// <summary>
+    /// Executes the action with throttling logic.
+    /// First request executes immediately.
+    /// Subsequent requests execute immediately if more than interval has passed,
+    /// otherwise they are throttled.
+    /// </summary>
+    public async Task ThrottleAsync(Func<Task> action)
     {
-        var now = DateTime.Now;
-        if ((now - _lastInvoke).TotalMilliseconds > _delayMilliseconds)
+        await _semaphore.WaitAsync();
+        
+        try
         {
-            // Not currently debouncing, run immediately
-            _pending = false;
-            _lastInvoke = now;
-            action();
-        }
-        else
-        {
-            // Rapid call: debounce
-            _pending = true;
-            _cts?.Cancel();
-            _cts = new CancellationTokenSource();
-            var token = _cts.Token;
+            var now = DateTime.UtcNow;
+            var timeSinceLastExecution = now - _lastExecutionTime;
 
-            Task.Delay(_delayMilliseconds, token)
-                .ContinueWith(t =>
+            // First request or more than interval has passed - execute immediately
+            if (timeSinceLastExecution >= _interval)
+            {
+                // Cancel any pending throttled request
+                CancelPendingRequest();
+                
+                _lastExecutionTime = now;
+                await action();
+                return;
+            }
+
+            // Within throttle window - schedule for later
+            CancelPendingRequest();
+            _currentCancellationTokenSource = new CancellationTokenSource();
+            var token = _currentCancellationTokenSource.Token;
+            
+            // Calculate delay: interval minus time since last execution
+            var delay = _interval - timeSinceLastExecution;
+            
+            _pendingTask = Task.Run(async () =>
+            {
+                try
                 {
-                    if (!t.IsCanceled && _pending)
+                    await Task.Delay(delay, token);
+                    
+                    if (!token.IsCancellationRequested)
                     {
-                        _pending = false;
-                        _lastInvoke = DateTime.Now;
-                        action();
+                        await _semaphore.WaitAsync(token);
+                        try
+                        {
+                            if (!token.IsCancellationRequested)
+                            {
+                                _lastExecutionTime = DateTime.UtcNow;
+                                await action();
+                            }
+                        }
+                        finally
+                        {
+                            _semaphore.Release();
+                        }
                     }
-                }, TaskScheduler.Current);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Expected when cancellation occurs
+                }
+            }, token);
         }
+        finally
+        {
+            _semaphore.Release();
+        }
+    }
+
+    private void CancelPendingRequest()
+    {
+        lock (_lock)
+        {
+            if (_currentCancellationTokenSource != null && !_currentCancellationTokenSource.IsCancellationRequested)
+            {
+                _currentCancellationTokenSource.Cancel();
+                _currentCancellationTokenSource.Dispose();
+                _currentCancellationTokenSource = null;
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        CancelPendingRequest();
+        _semaphore?.Dispose();
     }
 }
