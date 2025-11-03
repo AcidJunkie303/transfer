@@ -39,7 +39,7 @@ public class GridThrottler : IDisposable
             if (timeSinceLastExecution >= _interval)
             {
                 // Cancel any pending throttled request
-                CancelPendingRequest();
+                await CancelPendingRequestAsync();
                 
                 _lastExecutionTime = now;
                 await action();
@@ -47,7 +47,7 @@ public class GridThrottler : IDisposable
             }
 
             // Within throttle window - schedule for later
-            CancelPendingRequest();
+            await CancelPendingRequestAsync();
             _currentCancellationTokenSource = new CancellationTokenSource();
             var token = _currentCancellationTokenSource.Token;
             
@@ -89,22 +89,61 @@ public class GridThrottler : IDisposable
         }
     }
 
-    private void CancelPendingRequest()
+    private async Task CancelPendingRequestAsync()
     {
+        Task taskToAwait = null;
+        
         lock (_lock)
         {
             if (_currentCancellationTokenSource != null && !_currentCancellationTokenSource.IsCancellationRequested)
             {
                 _currentCancellationTokenSource.Cancel();
-                _currentCancellationTokenSource.Dispose();
-                _currentCancellationTokenSource = null;
             }
+            
+            taskToAwait = _pendingTask;
+            _pendingTask = null;
+        }
+
+        // Await outside the lock to prevent deadlocks
+        if (taskToAwait != null)
+        {
+            try
+            {
+                await taskToAwait;
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected
+            }
+        }
+
+        lock (_lock)
+        {
+            _currentCancellationTokenSource?.Dispose();
+            _currentCancellationTokenSource = null;
         }
     }
 
     public void Dispose()
     {
-        CancelPendingRequest();
+        // Synchronous dispose - just cancel and don't wait
+        lock (_lock)
+        {
+            _currentCancellationTokenSource?.Cancel();
+            _currentCancellationTokenSource?.Dispose();
+            _currentCancellationTokenSource = null;
+        }
+        
+        // Try to wait for pending task briefly
+        try
+        {
+            _pendingTask?.Wait(TimeSpan.FromMilliseconds(100));
+        }
+        catch
+        {
+            // Ignore exceptions during dispose
+        }
+        
         _semaphore?.Dispose();
     }
 }
