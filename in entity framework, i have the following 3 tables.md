@@ -1,178 +1,8 @@
 <img src="https://r2cdn.perplexity.ai/pplx-full-logo-primary-dark%402x.png" style="height:64px;margin-right:32px"/>
 
-# in entity framework, i have the following 3 tables:
+# When examining what kind of expression `telerikFilter.CreateFilterExpression()`generates, it's a LogicalBinaryExpression. So Expression<Func<A, bool>> wouldn't work
 
-A, B and C:
-
-B is an association table (n:n) with a dedicated primary key. WHen querying A using entity framework, how can i specify a filter for table C for the column Name?
-What i want is: Get A if any C contains a row with Name="myValue"
-
-Please also include the full entity framework core fluent configuration statements
-
-Also.. i want to inject this append this as expression tree to an existing expression created by blazor Telerik `IFilterDescriptor.CreateFilterExpression` as logical OR
-
-I'll help you set up the EF Core entities with fluent configuration and show you how to filter and combine expressions.
-
-## Entity Configuration
-
-```csharp
-// Entities
-public class A
-{
-    public int Id { get; set; }
-    public string SomeProperty { get; set; }
-    
-    // Navigation property
-    public ICollection<B> Bs { get; set; } = new List<B>();
-}
-
-public class B
-{
-    public int Id { get; set; }
-    public int AId { get; set; }
-    public int CId { get; set; }
-    
-    // Navigation properties
-    public A A { get; set; }
-    public C C { get; set; }
-}
-
-public class C
-{
-    public int Id { get; set; }
-    public string Name { get; set; }
-    
-    // Navigation property
-    public ICollection<B> Bs { get; set; } = new List<B>();
-}
-
-// DbContext with Fluent API Configuration
-public class MyDbContext : DbContext
-{
-    public DbSet<A> As { get; set; }
-    public DbSet<B> Bs { get; set; }
-    public DbSet<C> Cs { get; set; }
-
-    protected override void OnModelCreating(ModelBuilder modelBuilder)
-    {
-        // Configure A
-        modelBuilder.Entity<A>(entity =>
-        {
-            entity.HasKey(a => a.Id);
-            entity.Property(a => a.Id).ValueGeneratedOnAdd();
-            entity.Property(a => a.SomeProperty).HasMaxLength(200);
-        });
-
-        // Configure B (association table with own PK)
-        modelBuilder.Entity<B>(entity =>
-        {
-            entity.HasKey(b => b.Id);
-            entity.Property(b => b.Id).ValueGeneratedOnAdd();
-
-            // Configure relationship to A
-            entity.HasOne(b => b.A)
-                  .WithMany(a => a.Bs)
-                  .HasForeignKey(b => b.AId)
-                  .OnDelete(DeleteBehavior.Cascade);
-
-            // Configure relationship to C
-            entity.HasOne(b => b.C)
-                  .WithMany(c => c.Bs)
-                  .HasForeignKey(b => b.CId)
-                  .OnDelete(DeleteBehavior.Cascade);
-
-            // Optional: Create index for better query performance
-            entity.HasIndex(b => new { b.AId, b.CId });
-        });
-
-        // Configure C
-        modelBuilder.Entity<C>(entity =>
-        {
-            entity.HasKey(c => c.Id);
-            entity.Property(c => c.Id).ValueGeneratedOnAdd();
-            entity.Property(c => c.Name).IsRequired().HasMaxLength(100);
-            
-            // Optional: Create index on Name for filtering performance
-            entity.HasIndex(c => c.Name);
-        });
-
-        base.OnModelCreating(modelBuilder);
-    }
-}
-```
-
-
-## Querying with Filter
-
-```csharp
-// Simple LINQ query
-var result = await context.As
-    .Where(a => a.Bs.Any(b => b.C.Name == "myValue"))
-    .ToListAsync();
-
-// Or using navigation syntax
-var result = await context.As
-    .Where(a => a.Bs.Any(b => b.C.Name == "myValue"))
-    .Include(a => a.Bs)
-        .ThenInclude(b => b.C)
-    .ToListAsync();
-```
-
-
-## Building Expression Tree for Dynamic Filter
-
-```csharp
-using System.Linq.Expressions;
-
-public static class ExpressionHelper
-{
-    /// <summary>
-    /// Creates an expression tree for: a => a.Bs.Any(b => b.C.Name == value)
-    /// </summary>
-    public static Expression<Func<A, bool>> CreateCNameFilter(string value)
-    {
-        // a => a.Bs.Any(b => b.C.Name == value)
-        
-        // Parameter: a
-        var aParam = Expression.Parameter(typeof(A), "a");
-        
-        // Parameter for inner lambda: b
-        var bParam = Expression.Parameter(typeof(B), "b");
-        
-        // b.C
-        var bC = Expression.Property(bParam, nameof(B.C));
-        
-        // b.C.Name
-        var cName = Expression.Property(bC, nameof(C.Name));
-        
-        // "myValue" constant
-        var nameValue = Expression.Constant(value, typeof(string));
-        
-        // b.C.Name == "myValue"
-        var nameEquals = Expression.Equal(cName, nameValue);
-        
-        // b => b.C.Name == "myValue"
-        var innerLambda = Expression.Lambda<Func<B, bool>>(nameEquals, bParam);
-        
-        // a.Bs
-        var aBs = Expression.Property(aParam, nameof(A.Bs));
-        
-        // Enumerable.Any method
-        var anyMethod = typeof(Enumerable).GetMethods()
-            .First(m => m.Name == "Any" && m.GetParameters().Length == 2)
-            .MakeGenericMethod(typeof(B));
-        
-        // a.Bs.Any(b => b.C.Name == "myValue")
-        var anyCall = Expression.Call(null, anyMethod, aBs, innerLambda);
-        
-        // Final lambda: a => a.Bs.Any(b => b.C.Name == "myValue")
-        return Expression.Lambda<Func<A, bool>>(anyCall, aParam);
-    }
-}
-```
-
-
-## Combining with Telerik Filter Expression (Logical OR)
+You're correct! `CreateFilterExpression` returns an `Expression` (specifically a `BinaryExpression` or `LogicalBinaryExpression`), not a lambda expression. Here's the corrected code:
 
 ```csharp
 using Telerik.Blazor.Components;
@@ -188,48 +18,51 @@ public static class FilterExpressionCombiner
         IFilterDescriptor telerikFilter, 
         string cNameValue)
     {
-        // Get the Telerik filter expression
-        Expression<Func<A, bool>> telerikExpression = null;
+        // Create parameter for expression tree (shared across both expressions)
+        var parameter = Expression.Parameter(typeof(A), "a");
+        
+        Expression telerikExpression = null;
         
         if (telerikFilter != null)
         {
-            // CreateFilterExpression returns Expression, need to cast to Expression<Func<A, bool>>
-            var filterExpression = telerikFilter.CreateFilterExpression();
-            if (filterExpression != null)
-            {
-                telerikExpression = (Expression<Func<A, bool>>)filterExpression;
-            }
+            // CreateFilterExpression returns Expression (body only), not a lambda
+            telerikExpression = telerikFilter.CreateFilterExpression(parameter);
         }
         
         // Create the C.Name filter expression
-        var cNameExpression = ExpressionHelper.CreateCNameFilter(cNameValue);
+        var cNameFilterLambda = ExpressionHelper.CreateCNameFilter(cNameValue);
         
-        // If no Telerik filter, just return C.Name filter
+        // Extract the body and replace parameter to match our shared parameter
+        var cNameBody = new ParameterReplacer(cNameFilterLambda.Parameters[0], parameter)
+            .Visit(cNameFilterLambda.Body);
+        
+        // Combine expressions
+        Expression finalBody;
+        
         if (telerikExpression == null)
         {
-            return cNameExpression;
+            finalBody = cNameBody;
+        }
+        else
+        {
+            // Combine with OR: telerikFilter || cNameFilter
+            finalBody = Expression.OrElse(telerikExpression, cNameBody);
         }
         
-        // Combine with OR: telerikFilter || cNameFilter
-        return CombineWithOr(telerikExpression, cNameExpression);
+        // Wrap in lambda
+        return Expression.Lambda<Func<A, bool>>(finalBody, parameter);
     }
     
     /// <summary>
-    /// Combines two expressions with OR logic
+    /// Combines two expression bodies with OR logic, using a shared parameter
     /// </summary>
-    public static Expression<Func<T, bool>> CombineWithOr<T>(
-        Expression<Func<T, bool>> left, 
-        Expression<Func<T, bool>> right)
+    public static Expression<Func<T, bool>> CombineExpressionsWithOr<T>(
+        Expression leftBody,
+        Expression rightBody,
+        ParameterExpression parameter)
     {
-        // Get the parameter from the left expression
-        var parameter = left.Parameters[0];
-        
-        // Replace the parameter in the right expression with the left's parameter
-        var rightBody = new ParameterReplacer(right.Parameters[0], parameter)
-            .Visit(right.Body);
-        
         // Combine with OR
-        var combined = Expression.OrElse(left.Body, rightBody);
+        var combined = Expression.OrElse(leftBody, rightBody);
         
         // Create the final lambda
         return Expression.Lambda<Func<T, bool>>(combined, parameter);
@@ -258,75 +91,99 @@ public static class FilterExpressionCombiner
 ```
 
 
-## Usage Example
+## Alternative: More Flexible Approach
+
+If you want more control over how you build the expressions:
 
 ```csharp
-// In your Blazor component or service
-public async Task<List<A>> GetFilteredData(IFilterDescriptor telerikFilter)
+public static class FilterExpressionCombiner
 {
-    // Combine Telerik filter with C.Name filter
-    var combinedExpression = FilterExpressionCombiner.CombineWithTelerikFilter(
-        telerikFilter, 
-        "myValue");
-    
-    // Apply to query
-    var result = await context.As
-        .Where(combinedExpression)
-        .Include(a => a.Bs)
-            .ThenInclude(b => b.C)
-        .ToListAsync();
-    
-    return result;
-}
-
-// Or apply directly in Grid OnRead event
-private async Task OnGridRead(GridReadEventArgs args)
-{
-    var telerikFilter = args.Request.Filters.FirstOrDefault();
-    
-    var query = context.As.AsQueryable();
-    
-    if (telerikFilter != null || !string.IsNullOrEmpty(yourCNameFilter))
+    /// <summary>
+    /// Combines Telerik filter expression with custom C.Name filter using OR logic
+    /// </summary>
+    public static Expression<Func<A, bool>> CombineWithTelerikFilter(
+        IFilterDescriptor telerikFilter, 
+        string cNameValue)
     {
-        var combinedExpression = FilterExpressionCombiner.CombineWithTelerikFilter(
-            telerikFilter, 
-            yourCNameFilter);
+        // Create shared parameter
+        var parameter = Expression.Parameter(typeof(A), "a");
         
-        query = query.Where(combinedExpression);
+        // Build list of expression bodies to combine
+        var expressions = new List<Expression>();
+        
+        // Add Telerik filter if present
+        if (telerikFilter != null)
+        {
+            var telerikBody = telerikFilter.CreateFilterExpression(parameter);
+            if (telerikBody != null)
+            {
+                expressions.Add(telerikBody);
+            }
+        }
+        
+        // Add C.Name filter
+        var cNameBody = CreateCNameFilterBody(parameter, cNameValue);
+        expressions.Add(cNameBody);
+        
+        // Combine all expressions with OR
+        Expression combinedBody;
+        if (expressions.Count == 1)
+        {
+            combinedBody = expressions[0];
+        }
+        else
+        {
+            // Chain OR operations: expr1 || expr2 || expr3...
+            combinedBody = expressions[0];
+            for (int i = 1; i < expressions.Count; i++)
+            {
+                combinedBody = Expression.OrElse(combinedBody, expressions[i]);
+            }
+        }
+        
+        // Wrap in lambda
+        return Expression.Lambda<Func<A, bool>>(combinedBody, parameter);
     }
     
-    args.Data = await query.ToListAsync();
-    args.Total = await query.CountAsync();
-}
-```
-
-
-## Alternative: Extension Method Approach
-
-```csharp
-public static class QueryableExtensions
-{
-    public static IQueryable<A> WhereAnyCNameEquals(
-        this IQueryable<A> query, 
-        string value)
+    /// <summary>
+    /// Creates expression body for: a.Bs.Any(b => b.C.Name == value)
+    /// </summary>
+    private static Expression CreateCNameFilterBody(ParameterExpression aParam, string value)
     {
-        var expression = ExpressionHelper.CreateCNameFilter(value);
-        return query.Where(expression);
+        // Parameter for inner lambda: b
+        var bParam = Expression.Parameter(typeof(B), "b");
+        
+        // b.C.Name
+        var bC = Expression.Property(bParam, nameof(B.C));
+        var cName = Expression.Property(bC, nameof(C.Name));
+        
+        // b.C.Name == value
+        var nameValue = Expression.Constant(value, typeof(string));
+        var nameEquals = Expression.Equal(cName, nameValue);
+        
+        // b => b.C.Name == value
+        var innerLambda = Expression.Lambda<Func<B, bool>>(nameEquals, bParam);
+        
+        // a.Bs
+        var aBs = Expression.Property(aParam, nameof(A.Bs));
+        
+        // Enumerable.Any method
+        var anyMethod = typeof(Enumerable).GetMethods()
+            .First(m => m.Name == "Any" && m.GetParameters().Length == 2)
+            .MakeGenericMethod(typeof(B));
+        
+        // a.Bs.Any(b => b.C.Name == value)
+        return Expression.Call(null, anyMethod, aBs, innerLambda);
     }
-    
-    // Usage
-    var result = await context.As
-        .WhereAnyCNameEquals("myValue")
-        .ToListAsync();
 }
 ```
 
-The key points:
+The key differences:
 
-1. **Fluent API**: Full configuration with relationships, indexes, and constraints
-2. **Expression Tree**: Manually constructed using `Expression.Parameter`, `Expression.Property`, and `Expression.Call` for `Any()`
-3. **OR Combination**: Uses `Expression.OrElse` and parameter replacement to merge two expression trees
-4. **Telerik Integration**: Casts Telerik's filter expression and combines it with your custom filter
+1. **CreateFilterExpression returns Expression body**: Not a complete lambda, just the expression tree body
+2. **Shared parameter**: Both Telerik and your custom filter use the same `ParameterExpression` instance
+3. **Combine bodies**: Use `Expression.OrElse` on the expression bodies directly
+4. **Wrap at the end**: Only create the `Expression<Func<A, bool>>` lambda at the very end
 
-This approach generates efficient SQL with proper JOINs and the filter is applied at the database level, not in memory.
+This approach is cleaner since you don't need to extract and replace parameters - everything uses the same parameter from the start.
 
