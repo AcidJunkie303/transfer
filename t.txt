@@ -1,149 +1,39 @@
 using System;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Collections.Generic;
+using System.Linq;
 
-/// <summary>
-/// Throttler that allows immediate execution of the first request
-/// and subsequent requests only if more than the specified interval has passed.
-/// </summary>
-public class GridThrottler : IDisposable
+public static class LinqJoinExtensions
 {
-    private readonly TimeSpan _interval;
-    private DateTime _lastExecutionTime = DateTime.MinValue;
-    private CancellationTokenSource _currentCancellationTokenSource;
-    private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
-    private Task _pendingTask;
-    private readonly object _lock = new object();
-
-    public GridThrottler(TimeSpan interval)
+    public static IEnumerable<TResult> FullOuterJoin<TLeft, TRight, TKey, TResult>(
+        this IEnumerable<TLeft> left,
+        IEnumerable<TRight> right,
+        Func<TLeft, TKey> leftKeySelector,
+        Func<TRight, TKey> rightKeySelector,
+        Func<TLeft?, TRight?, TKey, TResult> resultSelector,
+        IEqualityComparer<TKey>? comparer = null)
+        where TLeft : class
+        where TRight : class
     {
-        _interval = interval;
-    }
+        ArgumentNullException.ThrowIfNull(left);
+        ArgumentNullException.ThrowIfNull(right);
+        ArgumentNullException.ThrowIfNull(leftKeySelector);
+        ArgumentNullException.ThrowIfNull(rightKeySelector);
+        ArgumentNullException.ThrowIfNull(resultSelector);
 
-    /// <summary>
-    /// Executes the action with throttling logic.
-    /// First request executes immediately.
-    /// Subsequent requests execute immediately if more than interval has passed,
-    /// otherwise they are throttled.
-    /// </summary>
-    public async Task ThrottleAsync(Func<Task> action)
-    {
-        await _semaphore.WaitAsync();
-        
-        try
-        {
-            var now = DateTime.UtcNow;
-            var timeSinceLastExecution = now - _lastExecutionTime;
+        var leftLookup  = left.ToLookup(leftKeySelector, comparer);
+        var rightLookup = right.ToLookup(rightKeySelector, comparer);
 
-            // First request or more than interval has passed - execute immediately
-            if (timeSinceLastExecution >= _interval)
-            {
-                // Cancel any pending throttled request
-                await CancelPendingRequestAsync();
-                
-                _lastExecutionTime = now;
-                await action();
-                return;
-            }
+        var keys = new HashSet<TKey>(leftLookup.Select(g => g.Key), comparer);
+        keys.UnionWith(rightLookup.Select(g => g.Key));
 
-            // Within throttle window - schedule for later
-            await CancelPendingRequestAsync();
-            _currentCancellationTokenSource = new CancellationTokenSource();
-            var token = _currentCancellationTokenSource.Token;
-            
-            // Calculate delay: interval minus time since last execution
-            var delay = _interval - timeSinceLastExecution;
-            
-            _pendingTask = Task.Run(async () =>
-            {
-                try
-                {
-                    await Task.Delay(delay, token);
-                    
-                    if (!token.IsCancellationRequested)
-                    {
-                        await _semaphore.WaitAsync(token);
-                        try
-                        {
-                            if (!token.IsCancellationRequested)
-                            {
-                                _lastExecutionTime = DateTime.UtcNow;
-                                await action();
-                            }
-                        }
-                        finally
-                        {
-                            _semaphore.Release();
-                        }
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                    // Expected when cancellation occurs
-                }
-            }, token);
-        }
-        finally
+        foreach (var key in keys)
         {
-            _semaphore.Release();
-        }
-    }
+            var lefts  = leftLookup[key].DefaultIfEmpty(null);
+            var rights = rightLookup[key].DefaultIfEmpty(null);
 
-    private async Task CancelPendingRequestAsync()
-    {
-        Task taskToAwait = null;
-        
-        lock (_lock)
-        {
-            if (_currentCancellationTokenSource != null && !_currentCancellationTokenSource.IsCancellationRequested)
-            {
-                _currentCancellationTokenSource.Cancel();
-            }
-            
-            taskToAwait = _pendingTask;
-            _pendingTask = null;
+            foreach (var l in lefts)
+            foreach (var r in rights)
+                yield return resultSelector(l, r, key);
         }
-
-        // Await outside the lock to prevent deadlocks
-        if (taskToAwait != null)
-        {
-            try
-            {
-                await taskToAwait;
-            }
-            catch (OperationCanceledException)
-            {
-                // Expected
-            }
-        }
-
-        lock (_lock)
-        {
-            _currentCancellationTokenSource?.Dispose();
-            _currentCancellationTokenSource = null;
-        }
-    }
-
-    public void Dispose()
-    {
-        // Synchronous dispose - just cancel and don't wait
-        lock (_lock)
-        {
-            _currentCancellationTokenSource?.Cancel();
-            _currentCancellationTokenSource?.Dispose();
-            _currentCancellationTokenSource = null;
-        }
-        
-        // Try to wait for pending task briefly
-        try
-        {
-            _pendingTask?.Wait(TimeSpan.FromMilliseconds(100));
-        }
-        catch
-        {
-            // Ignore exceptions during dispose
-        }
-        
-        _semaphore?.Dispose();
     }
 }
