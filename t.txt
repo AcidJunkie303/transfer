@@ -1,39 +1,38 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
+param(
+  [Parameter(Mandatory=$true)]
+  [string] $SiteName,
 
-public static class LinqJoinExtensions
-{
-    public static IEnumerable<TResult> FullOuterJoin<TLeft, TRight, TKey, TResult>(
-        this IEnumerable<TLeft> left,
-        IEnumerable<TRight> right,
-        Func<TLeft, TKey> leftKeySelector,
-        Func<TRight, TKey> rightKeySelector,
-        Func<TLeft?, TRight?, TKey, TResult> resultSelector,
-        IEqualityComparer<TKey>? comparer = null)
-        where TLeft : class
-        where TRight : class
-    {
-        ArgumentNullException.ThrowIfNull(left);
-        ArgumentNullException.ThrowIfNull(right);
-        ArgumentNullException.ThrowIfNull(leftKeySelector);
-        ArgumentNullException.ThrowIfNull(rightKeySelector);
-        ArgumentNullException.ThrowIfNull(resultSelector);
+  # 1 year is a common starting point (in seconds)
+  [uint32] $MaxAgeSeconds = 31536000,
 
-        var leftLookup  = left.ToLookup(leftKeySelector, comparer);
-        var rightLookup = right.ToLookup(rightKeySelector, comparer);
+  [switch] $IncludeSubDomains,
 
-        var keys = new HashSet<TKey>(leftLookup.Select(g => g.Key), comparer);
-        keys.UnionWith(rightLookup.Select(g => g.Key));
+  # IIS site-level redirect (replaces scheme with https and ignores port; expects HTTPS on 443)
+  [switch] $RedirectHttpToHttps,
 
-        foreach (var key in keys)
-        {
-            var lefts  = leftLookup[key].DefaultIfEmpty(null);
-            var rights = rightLookup[key].DefaultIfEmpty(null);
+  # Only enable if you have submitted the domain to the HSTS preload list
+  [switch] $Preload
+)
 
-            foreach (var l in lefts)
-            foreach (var r in rights)
-                yield return resultSelector(l, r, key);
-        }
-    }
+Import-Module IISAdministration
+Reset-IISServerManager -Confirm:$false
+Start-IISCommitDelay
+
+$sitesCollection = Get-IISConfigSection -SectionPath "system.applicationHost/sites" | Get-IISConfigCollection
+$siteElement = Get-IISConfigCollectionElement -ConfigCollection $sitesCollection -ConfigAttribute @{ name = $SiteName }
+
+if (-not $siteElement) {
+  throw "IIS site '$SiteName' not found."
 }
+
+$hstsElement = Get-IISConfigElement -ConfigElement $siteElement -ChildElementName "hsts"
+
+Set-IISConfigAttributeValue -ConfigElement $hstsElement -AttributeName "enabled" -AttributeValue $true
+Set-IISConfigAttributeValue -ConfigElement $hstsElement -AttributeName "max-age" -AttributeValue $MaxAgeSeconds
+
+Set-IISConfigAttributeValue -ConfigElement $hstsElement -AttributeName "includeSubDomains" -AttributeValue ([bool]$IncludeSubDomains)
+Set-IISConfigAttributeValue -ConfigElement $hstsElement -AttributeName "redirectHttpToHttps" -AttributeValue ([bool]$RedirectHttpToHttps)
+Set-IISConfigAttributeValue -ConfigElement $hstsElement -AttributeName "preload" -AttributeValue ([bool]$Preload)
+
+Stop-IISCommitDelay
+Remove-Module IISAdministration
