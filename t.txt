@@ -1,38 +1,58 @@
 param(
   [Parameter(Mandatory=$true)]
-  [string] $SiteName,
-
-  # 1 year is a common starting point (in seconds)
-  [uint32] $MaxAgeSeconds = 31536000,
-
-  [switch] $IncludeSubDomains,
-
-  # IIS site-level redirect (replaces scheme with https and ignores port; expects HTTPS on 443)
-  [switch] $RedirectHttpToHttps,
-
-  # Only enable if you have submitted the domain to the HSTS preload list
-  [switch] $Preload
+  [string] $SiteName
 )
 
-Import-Module IISAdministration
-Reset-IISServerManager -Confirm:$false
-Start-IISCommitDelay
+Import-Module WebAdministration
 
-$sitesCollection = Get-IISConfigSection -SectionPath "system.applicationHost/sites" | Get-IISConfigCollection
-$siteElement = Get-IISConfigCollectionElement -ConfigCollection $sitesCollection -ConfigAttribute @{ name = $SiteName }
+# 1) Anonymous Authentication: enabled
+Set-WebConfigurationProperty `
+  -PSPath 'IIS:\' `
+  -Location $SiteName `
+  -Filter 'system.webServer/security/authentication/anonymousAuthentication' `
+  -Name 'enabled' `
+  -Value $true  # default is true, but this forces it [page:0]
 
-if (-not $siteElement) {
-  throw "IIS site '$SiteName' not found."
-}
+# 2) Authorization Rules: Allow everyone, deny no one
+# IIS can have inherited rules; to guarantee "allow all", clear and add a single allow rule.
+Clear-WebConfiguration `
+  -PSPath 'IIS:\' `
+  -Location $SiteName `
+  -Filter 'system.webServer/security/authorization'  # <authorization> supports allow/deny rules [web:16][web:17]
 
-$hstsElement = Get-IISConfigElement -ConfigElement $siteElement -ChildElementName "hsts"
+Add-WebConfiguration `
+  -PSPath 'IIS:\' `
+  -Location $SiteName `
+  -Filter 'system.webServer/security/authorization' `
+  -Value @{ accessType = 'Allow'; users = '*' }      # users="*" applies to all users [web:17]
 
-Set-IISConfigAttributeValue -ConfigElement $hstsElement -AttributeName "enabled" -AttributeValue $true
-Set-IISConfigAttributeValue -ConfigElement $hstsElement -AttributeName "max-age" -AttributeValue $MaxAgeSeconds
+# 3) Request Filtering: "allow unlisted verbs" and "allow unlisted file extensions"
+# These are attributes on <verbs> and <fileExtensions> child elements. [page:0]
+Set-WebConfigurationProperty `
+  -PSPath 'IIS:\' `
+  -Location $SiteName `
+  -Filter 'system.webServer/security/requestFiltering/verbs' `
+  -Name 'allowUnlisted' `
+  -Value $true  # when false, unlisted verbs are denied [page:0]
 
-Set-IISConfigAttributeValue -ConfigElement $hstsElement -AttributeName "includeSubDomains" -AttributeValue ([bool]$IncludeSubDomains)
-Set-IISConfigAttributeValue -ConfigElement $hstsElement -AttributeName "redirectHttpToHttps" -AttributeValue ([bool]$RedirectHttpToHttps)
-Set-IISConfigAttributeValue -ConfigElement $hstsElement -AttributeName "preload" -AttributeValue ([bool]$Preload)
+Set-WebConfigurationProperty `
+  -PSPath 'IIS:\' `
+  -Location $SiteName `
+  -Filter 'system.webServer/security/requestFiltering/fileExtensions' `
+  -Name 'allowUnlisted' `
+  -Value $true  # when false, unlisted extensions are denied [page:0]
 
-Stop-IISCommitDelay
-Remove-Module IISAdministration
+# 4) Request Filtering: allow high-bit characters + allow double escaping
+Set-WebConfigurationProperty `
+  -PSPath 'IIS:\' `
+  -Location $SiteName `
+  -Filter 'system.webServer/security/requestFiltering' `
+  -Name 'allowHighBitCharacters' `
+  -Value $true  # attribute exists on <requestFiltering> [page:0]
+
+Set-WebConfigurationProperty `
+  -PSPath 'IIS:\' `
+  -Location $SiteName `
+  -Filter 'system.webServer/security/requestFiltering' `
+  -Name 'allowDoubleEscaping' `
+  -Value $true  # attribute exists on <requestFiltering> [page:0]
