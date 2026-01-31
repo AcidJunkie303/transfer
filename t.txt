@@ -1,58 +1,28 @@
-param(
-  [Parameter(Mandatory=$true)]
-  [string] $SiteName
-)
+# JetBrains Rider / IntelliJ-based IDEs
+.idea/**/workspace.xml
+.idea/**/tasks.xml
+.idea/**/usage.statistics.xml
+.idea/**/dictionaries
+.idea/**/shelf
 
-Import-Module WebAdministration
+# AWS (user-specific)
+.idea/**/aws.xml
 
-# 1) Anonymous Authentication: enabled
-Set-WebConfigurationProperty `
-  -PSPath 'IIS:\' `
-  -Location $SiteName `
-  -Filter 'system.webServer/security/authentication/anonymousAuthentication' `
-  -Name 'enabled' `
-  -Value $true  # default is true, but this forces it [page:0]
+# Generated files
+.idea/**/contentModel.xml
 
-# 2) Authorization Rules: Allow everyone, deny no one
-# IIS can have inherited rules; to guarantee "allow all", clear and add a single allow rule.
-Clear-WebConfiguration `
-  -PSPath 'IIS:\' `
-  -Location $SiteName `
-  -Filter 'system.webServer/security/authorization'  # <authorization> supports allow/deny rules [web:16][web:17]
+# Data sources (often sensitive / high-churn)
+.idea/**/dataSources/
+.idea/**/dataSources.ids
+.idea/**/dataSources.local.xml
+.idea/**/sqlDataSources.xml
+.idea/**/dynamic.xml
+.idea/**/uiDesigner.xml
+.idea/**/dbnavigator.xml
 
-Add-WebConfiguration `
-  -PSPath 'IIS:\' `
-  -Location $SiteName `
-  -Filter 'system.webServer/security/authorization' `
-  -Value @{ accessType = 'Allow'; users = '*' }      # users="*" applies to all users [web:17]
+# Gradle-related (only relevant if you use Gradle)
+.idea/**/gradle.xml
+.idea/**/libraries
 
-# 3) Request Filtering: "allow unlisted verbs" and "allow unlisted file extensions"
-# These are attributes on <verbs> and <fileExtensions> child elements. [page:0]
-Set-WebConfigurationProperty `
-  -PSPath 'IIS:\' `
-  -Location $SiteName `
-  -Filter 'system.webServer/security/requestFiltering/verbs' `
-  -Name 'allowUnlisted' `
-  -Value $true  # when false, unlisted verbs are denied [page:0]
-
-Set-WebConfigurationProperty `
-  -PSPath 'IIS:\' `
-  -Location $SiteName `
-  -Filter 'system.webServer/security/requestFiltering/fileExtensions' `
-  -Name 'allowUnlisted' `
-  -Value $true  # when false, unlisted extensions are denied [page:0]
-
-# 4) Request Filtering: allow high-bit characters + allow double escaping
-Set-WebConfigurationProperty `
-  -PSPath 'IIS:\' `
-  -Location $SiteName `
-  -Filter 'system.webServer/security/requestFiltering' `
-  -Name 'allowHighBitCharacters' `
-  -Value $true  # attribute exists on <requestFiltering> [page:0]
-
-Set-WebConfigurationProperty `
-  -PSPath 'IIS:\' `
-  -Location $SiteName `
-  -Filter 'system.webServer/security/requestFiltering' `
-  -Name 'allowDoubleEscaping' `
-  -Value $true  # attribute exists on <requestFiltering> [page:0]
+# CMake (if applicable)
+cmake-build-*/
